@@ -1,0 +1,767 @@
+#!/usr/bin/env python3
+"""
+Web Dashboard for Simple SNMP Network Monitor
+Integrates with simple_snmp_monitor.py for reliable SNMP monitoring
+"""
+
+import time
+import json
+import threading
+from datetime import datetime, timedelta
+from flask import Flask, render_template, jsonify
+from simple_snmp_monitor import SimpleSnmpMonitor
+import queue
+import signal
+import sys
+import os
+
+app = Flask(__name__)
+
+class WebDashboard:
+    def __init__(self, snmp_host='localhost', snmp_community='public'):
+        self.monitor = SimpleSnmpMonitor(snmp_host, snmp_community)
+        self.current_data = {}
+        self.historical_data = []
+        self.monitoring = False
+        self.monitor_thread = None
+        self.max_history_points = 100
+        
+    def start_monitoring(self, interval=5):
+        """Start the monitoring thread"""
+        self.monitoring = True
+        self.monitor_thread = threading.Thread(target=self._monitor_loop, args=(interval,))
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+        print(f"Started monitoring with {interval}s interval")
+        
+    def stop_monitoring(self):
+        """Stop the monitoring thread"""
+        self.monitoring = False
+        if self.monitor_thread:
+            self.monitor_thread.join()
+        print("Monitoring stopped")
+    
+    def _monitor_loop(self, interval):
+        """Main monitoring loop"""
+        previous_stats = None
+        previous_time = None
+        
+        while self.monitoring:
+            try:
+                current_time = time.time()
+                
+                # Get current system and interface data
+                system_info = self.monitor.get_system_info()
+                interfaces = self.monitor.get_interfaces()
+                current_stats = self.monitor.get_interface_stats()
+                
+                # Calculate rates if we have previous data
+                rates = {}
+                if previous_stats and previous_time:
+                    time_diff = current_time - previous_time
+                    if time_diff > 0:
+                        for index in current_stats.keys():
+                            if index in previous_stats:
+                                curr = current_stats[index]
+                                prev = previous_stats[index]
+                                
+                                in_rate = max(0, (curr['in_octets'] - prev['in_octets']) / time_diff)
+                                out_rate = max(0, (curr['out_octets'] - prev['out_octets']) / time_diff)
+                                in_pps = max(0, (curr['in_packets'] - prev['in_packets']) / time_diff)
+                                out_pps = max(0, (curr['out_packets'] - prev['out_packets']) / time_diff)
+                                
+                                rates[index] = {
+                                    'in_bps': in_rate,
+                                    'out_bps': out_rate,
+                                    'in_mbps': in_rate * 8 / 1000000,
+                                    'out_mbps': out_rate * 8 / 1000000,
+                                    'in_pps': in_pps,
+                                    'out_pps': out_pps
+                                }
+                
+                # Prepare dashboard data
+                dashboard_data = {
+                    'timestamp': datetime.now().isoformat(),
+                    'system_info': system_info,
+                    'interfaces': []
+                }
+                
+                # Process interfaces
+                for index in sorted(interfaces.keys(), key=int):
+                    interface = interfaces[index]
+                    stats = current_stats.get(index, {})
+                    rate = rates.get(index, {})
+                    
+                    interface_data = {
+                        'index': int(index),
+                        'name': interface['name'],
+                        'admin_status': interface['admin_status_text'],
+                        'oper_status': interface['oper_status_text'],
+                        'speed': interface['speed'],
+                        'in_octets': stats.get('in_octets', 0),
+                        'out_octets': stats.get('out_octets', 0),
+                        'in_packets': stats.get('in_packets', 0),
+                        'out_packets': stats.get('out_packets', 0),
+                        'in_bps': rate.get('in_bps', 0),
+                        'out_bps': rate.get('out_bps', 0),
+                        'in_mbps': rate.get('in_mbps', 0),
+                        'out_mbps': rate.get('out_mbps', 0),
+                        'in_pps': rate.get('in_pps', 0),
+                        'out_pps': rate.get('out_pps', 0)
+                    }
+                    dashboard_data['interfaces'].append(interface_data)
+                
+                # Store current data
+                self.current_data = dashboard_data
+                
+                # Add to historical data
+                self.historical_data.append(dashboard_data)
+                if len(self.historical_data) > self.max_history_points:
+                    self.historical_data.pop(0)
+                
+                # Store for next iteration
+                previous_stats = current_stats.copy()
+                previous_time = current_time
+                
+                time.sleep(interval)
+                
+            except Exception as e:
+                print(f"Monitoring error: {e}")
+                time.sleep(interval)
+    
+    def get_current_data(self):
+        """Get current monitoring data"""
+        return self.current_data if self.current_data else {'interfaces': [], 'system_info': {}}
+    
+    def get_historical_data(self, minutes=30):
+        """Get historical data for specified minutes"""
+        if not self.historical_data:
+            return []
+            
+        cutoff_time = datetime.now() - timedelta(minutes=minutes)
+        
+        filtered_data = []
+        for data_point in self.historical_data:
+            try:
+                data_time = datetime.fromisoformat(data_point['timestamp'])
+                if data_time >= cutoff_time:
+                    filtered_data.append(data_point)
+            except:
+                continue
+        
+        return filtered_data
+
+# Global dashboard instance
+dashboard = None
+
+@app.route('/')
+def index():
+    """Main dashboard page"""
+    return render_template('dashboard.html')
+
+@app.route('/api/current')
+def api_current():
+    """API endpoint for current data"""
+    if dashboard:
+        return jsonify(dashboard.get_current_data())
+    return jsonify({'error': 'Dashboard not initialized'})
+
+@app.route('/api/historical/<int:minutes>')
+def api_historical(minutes):
+    """API endpoint for historical data"""
+    if dashboard:
+        return jsonify(dashboard.get_historical_data(minutes))
+    return jsonify([])
+
+@app.route('/api/status')
+def api_status():
+    """API endpoint for monitoring status"""
+    if dashboard:
+        return jsonify({
+            'monitoring': dashboard.monitoring,
+            'data_points': len(dashboard.historical_data),
+            'last_update': dashboard.current_data.get('timestamp', None) if dashboard.current_data else None
+        })
+    return jsonify({'monitoring': False, 'data_points': 0, 'last_update': None})
+
+def create_dashboard_template():
+    """Create the HTML template for the dashboard"""
+    template_dir = os.path.join(os.path.dirname(__file__), 'templates')
+    os.makedirs(template_dir, exist_ok=True)
+    
+    html_content = '''<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simple SNMP Network Monitor Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background-color: #f5f7fa; 
+            color: #333;
+        }
+        
+        .header { 
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white; 
+            padding: 20px; 
+            text-align: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        .header h1 { margin-bottom: 10px; font-size: 2.5em; }
+        .header p { margin-bottom: 15px; font-size: 1.1em; opacity: 0.9; }
+        
+        .status-bar {
+            background: rgba(255,255,255,0.2);
+            border-radius: 20px;
+            padding: 10px 20px;
+            display: inline-flex;
+            align-items: center;
+            gap: 15px;
+        }
+        
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        
+        .status-active { background-color: #4CAF50; }
+        .status-inactive { background-color: #f44336; }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+        
+        .controls {
+            background: white;
+            padding: 20px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        
+        .btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+        }
+        
+        .btn:hover { background: #5a6fd8; transform: translateY(-1px); }
+        .btn:active { transform: translateY(0); }
+        .btn-success { background: #4CAF50; }
+        .btn-danger { background: #f44336; }
+        
+        .system-info {
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .system-info h3 {
+            margin-bottom: 20px;
+            color: #667eea;
+            font-size: 1.4em;
+            border-bottom: 2px solid #f0f2f5;
+            padding-bottom: 10px;
+        }
+        
+        .system-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        
+        .system-item {
+            padding: 15px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .system-label { font-weight: 600; color: #666; font-size: 0.9em; }
+        .system-value { font-size: 1.1em; margin-top: 5px; color: #333; }
+        
+        .chart-container {
+            background: white;
+            padding: 25px;
+            border-radius: 12px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .chart-container h3 {
+            margin-bottom: 20px;
+            color: #667eea;
+            font-size: 1.4em;
+        }
+        
+        .interface-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+            gap: 20px;
+        }
+        
+        .interface-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+        
+        .interface-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+        }
+        
+        .interface-header {
+            font-weight: 600;
+            font-size: 1.2em;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #f0f2f5;
+            color: #333;
+        }
+        
+        .interface-status {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 15px;
+        }
+        
+        .status-badge {
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            font-weight: 500;
+            text-transform: uppercase;
+        }
+        
+        .status-up { background: #d4edda; color: #155724; }
+        .status-down { background: #f8d7da; color: #721c24; }
+        
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+        }
+        
+        .metric {
+            padding: 12px;
+            background: #f8f9fa;
+            border-radius: 6px;
+        }
+        
+        .metric-label {
+            font-size: 0.85em;
+            color: #666;
+            font-weight: 500;
+        }
+        
+        .metric-value {
+            font-size: 1.1em;
+            font-weight: 600;
+            color: #333;
+            margin-top: 4px;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+            font-size: 1.1em;
+        }
+        
+        .error {
+            text-align: center;
+            padding: 40px;
+            color: #f44336;
+            background: #ffebee;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        
+        @media (max-width: 768px) {
+            .controls { flex-direction: column; align-items: stretch; }
+            .system-grid { grid-template-columns: 1fr; }
+            .interface-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🌐 SNMP Network Monitor</h1>
+        <p>Real-time Mininet network monitoring dashboard</p>
+        <div class="status-bar">
+            <span>Status:</span>
+            <span class="status-indicator" id="statusIndicator"></span>
+            <span id="statusText">Connecting...</span>
+            <span>|</span>
+            <span>Last Update: <span id="lastUpdate">Never</span></span>
+        </div>
+    </div>
+    
+    <div class="container">
+        <div class="controls">
+            <div>
+                <button class="btn" onclick="refreshData()">🔄 Refresh Now</button>
+                <button class="btn" onclick="toggleAutoRefresh()" id="autoRefreshBtn">⏹️ Stop Auto-refresh</button>
+            </div>
+            <div>
+                <span>Auto-refresh: <strong><span id="refreshInterval">5</span>s</span></span>
+            </div>
+        </div>
+        
+        <div class="system-info" id="systemInfo">
+            <div class="loading">Loading system information...</div>
+        </div>
+        
+        <div class="chart-container">
+            <h3>📊 Network Traffic Trends</h3>
+            <canvas id="trafficChart" height="100"></canvas>
+        </div>
+        
+        <div class="interface-grid" id="interfaceGrid">
+            <div class="loading">Loading interface data...</div>
+        </div>
+    </div>
+
+    <script>
+        let autoRefresh = true;
+        let refreshTimer;
+        let chart;
+        const refreshInterval = 5000; // 5 seconds
+
+        function initChart() {
+            const ctx = document.getElementById('trafficChart').getContext('2d');
+            chart = new Chart(ctx, {
+                type: 'line',
+                data: { labels: [], datasets: [] },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    animation: { duration: 0 },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: 'Mbps' }
+                        },
+                        x: {
+                            title: { display: true, text: 'Time' }
+                        }
+                    },
+                    plugins: {
+                        legend: { display: true, position: 'top' }
+                    }
+                }
+            });
+        }
+
+        function updateChart(historicalData) {
+            if (!chart || !historicalData.length) return;
+
+            const labels = [];
+            const datasets = {};
+            const colors = ['#667eea', '#764ba2', '#f093fb', '#f5576c', '#4facfe', '#00f2fe'];
+            let colorIndex = 0;
+
+            historicalData.slice(-20).forEach(dataPoint => {
+                const time = new Date(dataPoint.timestamp).toLocaleTimeString();
+                labels.push(time);
+
+                dataPoint.interfaces.forEach(interface => {
+                    if (interface.name.includes('lo') || interface.name.includes('sit0') || 
+                        interface.name.includes('tunl0') || interface.name.includes('ip6tnl0')) return;
+
+                    const inKey = `${interface.name} In`;
+                    const outKey = `${interface.name} Out`;
+
+                    if (!datasets[inKey]) {
+                        datasets[inKey] = {
+                            label: inKey,
+                            data: [],
+                            borderColor: colors[colorIndex % colors.length],
+                            backgroundColor: colors[colorIndex % colors.length] + '20',
+                            fill: false,
+                            tension: 0.1
+                        };
+                        colorIndex++;
+                    }
+                    if (!datasets[outKey]) {
+                        datasets[outKey] = {
+                            label: outKey,
+                            data: [],
+                            borderColor: colors[colorIndex % colors.length],
+                            backgroundColor: colors[colorIndex % colors.length] + '20',
+                            fill: false,
+                            tension: 0.1
+                        };
+                        colorIndex++;
+                    }
+
+                    datasets[inKey].data.push(interface.in_mbps || 0);
+                    datasets[outKey].data.push(interface.out_mbps || 0);
+                });
+            });
+
+            chart.data.labels = labels;
+            chart.data.datasets = Object.values(datasets);
+            chart.update('none');
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        function updateSystemInfo(data) {
+            const systemInfo = document.getElementById('systemInfo');
+            
+            if (!data.system_info) {
+                systemInfo.innerHTML = '<div class="error">❌ No system information available</div>';
+                return;
+            }
+
+            const info = data.system_info;
+            systemInfo.innerHTML = `
+                <h3>🖥️ System Information</h3>
+                <div class="system-grid">
+                    <div class="system-item">
+                        <div class="system-label">System Name</div>
+                        <div class="system-value">${info.system_name || 'Unknown'}</div>
+                    </div>
+                    <div class="system-item">
+                        <div class="system-label">Uptime</div>
+                        <div class="system-value">${info.uptime_formatted || 'Unknown'}</div>
+                    </div>
+                    <div class="system-item">
+                        <div class="system-label">Interface Count</div>
+                        <div class="system-value">${info.interface_count || 0}</div>
+                    </div>
+                    <div class="system-item">
+                        <div class="system-label">Last Update</div>
+                        <div class="system-value">${new Date(data.timestamp).toLocaleTimeString()}</div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function updateInterfaces(data) {
+            const grid = document.getElementById('interfaceGrid');
+            
+            if (!data.interfaces || data.interfaces.length === 0) {
+                grid.innerHTML = '<div class="error">❌ No interface data available</div>';
+                return;
+            }
+
+            grid.innerHTML = '';
+            
+            data.interfaces.forEach(interface => {
+                // Skip certain system interfaces for cleaner display
+                if (interface.name.includes('sit0') || interface.name.includes('tunl0') || 
+                    interface.name.includes('ip6tnl0')) return;
+
+                const card = document.createElement('div');
+                card.className = 'interface-card';
+                
+                const statusClass = interface.oper_status === 'up' ? 'status-up' : 'status-down';
+                
+                card.innerHTML = `
+                    <div class="interface-header">
+                        🔌 ${interface.name} <small>(Index: ${interface.index})</small>
+                    </div>
+                    <div class="interface-status">
+                        <span class="status-badge ${statusClass}">
+                            ${interface.admin_status}/${interface.oper_status}
+                        </span>
+                        <small>Speed: ${interface.speed} bps</small>
+                    </div>
+                    <div class="metrics-grid">
+                        <div class="metric">
+                            <div class="metric-label">📥 Traffic In</div>
+                            <div class="metric-value">${formatBytes(interface.in_octets)}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">📤 Traffic Out</div>
+                            <div class="metric-value">${formatBytes(interface.out_octets)}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">⚡ Rate In</div>
+                            <div class="metric-value">${(interface.in_mbps || 0).toFixed(2)} Mbps</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">⚡ Rate Out</div>
+                            <div class="metric-value">${(interface.out_mbps || 0).toFixed(2)} Mbps</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">📦 Packets In</div>
+                            <div class="metric-value">${interface.in_packets}</div>
+                        </div>
+                        <div class="metric">
+                            <div class="metric-label">📦 Packets Out</div>
+                            <div class="metric-value">${interface.out_packets}</div>
+                        </div>
+                    </div>
+                `;
+                
+                grid.appendChild(card);
+            });
+        }
+
+        async function refreshData() {
+            try {
+                document.getElementById('statusIndicator').className = 'status-indicator status-active';
+                document.getElementById('statusText').textContent = 'Updating...';
+                
+                const currentResponse = await fetch('/api/current');
+                const currentData = await currentResponse.json();
+                
+                if (currentData && Object.keys(currentData).length > 0 && !currentData.error) {
+                    updateSystemInfo(currentData);
+                    updateInterfaces(currentData);
+                    document.getElementById('statusText').textContent = 'Connected';
+                    document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
+                    
+                    const historicalResponse = await fetch('/api/historical/10');
+                    const historicalData = await historicalResponse.json();
+                    updateChart(historicalData);
+                } else {
+                    throw new Error(currentData.error || 'No data received');
+                }
+                
+            } catch (error) {
+                console.error('Error refreshing data:', error);
+                document.getElementById('statusText').textContent = 'Error: ' + error.message;
+                document.getElementById('systemInfo').innerHTML = '<div class="error">❌ Failed to load data. Check if SNMP monitoring is running.</div>';
+                document.getElementById('interfaceGrid').innerHTML = '<div class="error">❌ Failed to load interface data.</div>';
+            } finally {
+                document.getElementById('statusIndicator').className = 'status-indicator status-inactive';
+            }
+        }
+
+        function toggleAutoRefresh() {
+            autoRefresh = !autoRefresh;
+            const btn = document.getElementById('autoRefreshBtn');
+            
+            if (autoRefresh) {
+                btn.innerHTML = '⏹️ Stop Auto-refresh';
+                btn.className = 'btn btn-danger';
+                startAutoRefresh();
+            } else {
+                btn.innerHTML = '▶️ Start Auto-refresh';
+                btn.className = 'btn btn-success';
+                if (refreshTimer) clearInterval(refreshTimer);
+            }
+        }
+
+        function startAutoRefresh() {
+            if (refreshTimer) clearInterval(refreshTimer);
+            refreshTimer = setInterval(refreshData, refreshInterval);
+        }
+
+        window.onload = function() {
+            initChart();
+            refreshData();
+            if (autoRefresh) startAutoRefresh();
+        };
+
+        window.onbeforeunload = function() {
+            if (refreshTimer) clearInterval(refreshTimer);
+        };
+    </script>
+</body>
+</html>'''
+    
+    with open(os.path.join(template_dir, 'dashboard.html'), 'w') as f:
+        f.write(html_content)
+
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print('\nShutting down dashboard...')
+    if dashboard:
+        dashboard.stop_monitoring()
+    sys.exit(0)
+
+def main():
+    """Main function to run the dashboard"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Web Dashboard for Simple SNMP Network Monitor')
+    parser.add_argument('--host', default='localhost', help='SNMP host (default: localhost)')
+    parser.add_argument('--community', default='public', help='SNMP community (default: public)')
+    parser.add_argument('--port', type=int, default=5000, help='Web server port (default: 5000)')
+    parser.add_argument('--interval', type=int, default=5, help='Monitoring interval in seconds (default: 5)')
+    
+    args = parser.parse_args()
+    
+    # Set up signal handler
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Create dashboard template
+    create_dashboard_template()
+    
+    # Test SNMP connectivity first
+    test_monitor = SimpleSnmpMonitor(args.host, args.community)
+    test_result = test_monitor.snmp_get('1.3.6.1.2.1.1.1.0')
+    
+    if not test_result:
+        print("❌ Error: Cannot connect to SNMP agent")
+        print("Please ensure:")
+        print("  1. SNMP daemon is running: sudo systemctl start snmpd")
+        print("  2. Community string is correct")
+        print("  3. Host is reachable")
+        sys.exit(1)
+    
+    print("✅ SNMP connection test successful")
+    
+    # Initialize dashboard
+    global dashboard
+    dashboard = WebDashboard(args.host, args.community)
+    
+    # Start monitoring
+    dashboard.start_monitoring(args.interval)
+    
+    print(f"🚀 Starting Web Dashboard...")
+    print(f"   SNMP Host: {args.host}")
+    print(f"   SNMP Community: {args.community}")
+    print(f"   Monitoring Interval: {args.interval} seconds")
+    print(f"   Web Interface: http://localhost:{args.port}")
+    print("   Press Ctrl+C to stop")
+    print("=" * 50)
+    
+    # Start web server
+    try:
+        app.run(host='0.0.0.0', port=args.port, debug=False)
+    except KeyboardInterrupt:
+        signal_handler(None, None)
+
+if __name__ == '__main__':
+    main()
