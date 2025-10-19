@@ -145,6 +145,27 @@ class SimpleSnmpMonitor:
     def get_status_text(self, status):
         """Convert numeric status to text"""
         status_map = {1: 'up', 2: 'down', 3: 'testing'}
+        
+        # Handle both numeric and text formats
+        if isinstance(status, str):
+            # Parse strings like "up(1)" or "down(2)"
+            if '(' in status:
+                try:
+                    numeric_part = status.split('(')[1].split(')')[0]
+                    status = int(numeric_part)
+                except (IndexError, ValueError):
+                    return status.lower()  # Return original if parsing fails
+            else:
+                # Handle direct text values
+                status_lower = status.lower()
+                if status_lower in ['up', 'down', 'testing']:
+                    return status_lower
+                # Try to convert to int
+                try:
+                    status = int(status)
+                except ValueError:
+                    return 'unknown'
+        
         return status_map.get(int(status), 'unknown')
     
     def get_interface_stats(self):
